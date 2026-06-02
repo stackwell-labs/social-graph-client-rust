@@ -1,0 +1,21 @@
+[package]
+name = "social-graph-client"
+version = "0.1.0"
+edition = "2021"
+description = "Shared wire types and a typed async client for the Social Graph service API."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/coreygirard/social-graph-client"
+documentation = "https://docs.rs/social-graph-client"
+readme = "README.md"
+keywords = ["social-graph", "client", "api", "wire"]
+categories = ["web-programming", "api-bindings"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
+wiremock = "0.6"
