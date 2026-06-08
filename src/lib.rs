@@ -6,21 +6,27 @@
 //! …); those copies drift. Anything in this crate is derived from the real
 //! server handlers in `social-graph/backend/src/api/social_graph.rs`.
 //!
-//! Two surfaces are modeled today:
+//! # The pairwise / pseudonym surface (since 0.2.0)
 //!
-//! - **`GET /api/me`** — the *user-token* surface. The caller presents their
-//!   own ChirpAuth bearer (a token Social Graph itself issued, or one from an
-//!   audience that adopts Social Graph's identity). Resolves the caller to
-//!   their canonical Social Graph `userId`. The server projects a richer
-//!   self-view (email, display name, …); consumers that only need the id
-//!   deserialize through [`MeResponse`], which ignores the extra fields.
+//! All three modeled surfaces are **internal-service** endpoints: the caller
+//! presents the shared bearer token (`SOCIAL_GRAPH_INTERNAL_SERVICE_TOKEN`)
+//! out-of-band, passes an **app-scoped chirp `sub`** (pairwise per app — a
+//! different sub per app for the same human) as input, and gets back the app's
+//! own opaque **per-(app, user) pseudonym** or a connectedness bool — **never a
+//! global `users.id`**, so two apps can't correlate the same human.
 //!
-//! - **`GET /internal/graph/is_connected?a=&b=`** — the *internal-service*
-//!   surface. The caller presents a shared bearer token
-//!   (`SOCIAL_GRAPH_INTERNAL_SERVICE_TOKEN`) out-of-band, not a per-user
-//!   token, and asks whether two Social Graph users are graph-connected. The
-//!   endpoint returns `503` when the deployment has no internal token
-//!   configured and `401` on token mismatch.
+//! - **`POST /internal/graph/resolve-self`** → the app's own pseudonym for its
+//!   own user ([`resolve_self`](SocialGraphClient::resolve_self)). `None` when
+//!   the sub isn't bridged yet (fail-visible).
+//! - **`POST /internal/graph/resolve-audience`** → the user's connections, as
+//!   *this app's* pseudonyms ([`resolve_audience`](SocialGraphClient::resolve_audience)).
+//! - **`POST /internal/graph/connected`** → whether two subs are graph-connected
+//!   ([`connected`](SocialGraphClient::connected)); resolves both via the
+//!   `(chirp_sub -> users.id)` bridge.
+//!
+//! The legacy `GET /api/me` (`resolve_me`) and `GET /internal/graph/is_connected`
+//! (`is_connected`) surfaces — which handed apps the global `users.id` and so
+//! let two apps correlate a shared user — were **retired in 0.2.0**.
 //!
 //! # Example
 //!
@@ -32,58 +38,82 @@
 //!     reqwest::Client::new(),
 //!     "https://socialgraph.example",
 //! );
+//! let token = "internal-service-token";
 //!
-//! // Resolve the caller (presenting their own user bearer) to their userId.
-//! let my_id = client.resolve_me("user-bearer-token").await?;
+//! // Resolve the caller's app-scoped sub to this app's pseudonym for them.
+//! let me = client.resolve_self(token, "sub_app_alice", "my-app").await?;
 //!
-//! // Ask whether two users are connected, presenting the internal token.
-//! let connected = client
-//!     .is_connected("internal-service-token", &my_id, "sg_other")
-//!     .await?;
-//! # let _ = (my_id, connected);
+//! // Their connections, as this app's pseudonyms (the valid send targets).
+//! let audience = client.resolve_audience(token, "sub_app_alice", "my-app").await?;
+//! # let _ = (me, audience);
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! [Social Graph]: https://github.com/coreygirard
+//! [Social Graph]: https://github.com/stackwell-labs
 
 use serde::{Deserialize, Serialize};
 
-/// Route path for the user-token self-resolution endpoint.
-///
-/// Mirrors the `GET /api/me` route registered by the server.
-pub const ROUTE_ME: &str = "/api/me";
+/// `POST` route resolving an app-scoped sub to the app's own pseudonym.
+pub const ROUTE_RESOLVE_SELF: &str = "/internal/graph/resolve-self";
 
-/// Route path for the internal connectedness lookup.
-///
-/// Mirrors the `GET /internal/graph/is_connected` route registered by the
-/// server. Takes `a` and `b` query parameters (Social Graph `userId`s) and an
-/// `Authorization: Bearer <internal-service-token>` header.
-pub const ROUTE_IS_CONNECTED: &str = "/internal/graph/is_connected";
+/// `POST` route resolving a viewer's connections to the app's pseudonyms.
+pub const ROUTE_RESOLVE_AUDIENCE: &str = "/internal/graph/resolve-audience";
 
-/// Response shape of `GET /api/me`, narrowed to the caller's `userId`.
-///
-/// The server returns a richer object (the self-view also carries `email`,
-/// `displayName`, `avatarUrl`); any field not declared here is ignored on
-/// deserialize, so this stays valid as the server's self-view grows.
+/// `POST` route asking whether two app-scoped subs are graph-connected.
+pub const ROUTE_CONNECTED: &str = "/internal/graph/connected";
+
+/// Request body for [`resolve_self`](SocialGraphClient::resolve_self).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MeResponse {
-    /// The caller's canonical Social Graph `userId`.
-    pub id: String,
+pub struct ResolveSelfRequest {
+    /// The caller's app-scoped chirp `sub` (pairwise per app).
+    pub subject_sub: String,
+    /// The app's client id — the namespace its pseudonyms are minted under.
+    pub client_id: String,
 }
 
-/// Response shape of `GET /internal/graph/is_connected`.
-///
-/// Field names match the server's `serde::Serialize` output exactly
-/// (no rename): `connected`, `user_a`, `user_b`.
+/// Response of [`resolve_self`](SocialGraphClient::resolve_self).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IsConnectedResponse {
-    /// Whether `user_a` and `user_b` are graph-connected.
+pub struct ResolveSelfResponse {
+    /// The app's own pseudonym for its own user; `None` (server: `null`) when
+    /// the sub is not yet bridged into Social Graph (fail-visible).
+    pub app_user_id: Option<String>,
+}
+
+/// Request body for [`resolve_audience`](SocialGraphClient::resolve_audience).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveAudienceRequest {
+    /// The viewer's app-scoped chirp `sub`.
+    pub viewer_sub: String,
+    /// The app's client id (pseudonym namespace).
+    pub client_id: String,
+}
+
+/// Response of [`resolve_audience`](SocialGraphClient::resolve_audience).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveAudienceResponse {
+    /// `false` when the viewer sub isn't bridged — distinguishes "unknown
+    /// viewer" from "viewer with no connections".
+    pub resolved: bool,
+    /// The viewer's connections, as *this app's* pseudonyms (never raw ids).
+    pub audience: Vec<String>,
+}
+
+/// Request body for [`connected`](SocialGraphClient::connected).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectedRequest {
+    /// One party's app-scoped chirp `sub`.
+    pub viewer_sub: String,
+    /// The other party's app-scoped chirp `sub`.
+    pub target_sub: String,
+}
+
+/// Response of [`connected`](SocialGraphClient::connected).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectedResponse {
+    /// Whether the two subjects are graph-connected. `false` if either sub is
+    /// unbridged (the server resolves both via the bridge first).
     pub connected: bool,
-    /// The `a` query parameter echoed back (trimmed by the server).
-    pub user_a: String,
-    /// The `b` query parameter echoed back (trimmed by the server).
-    pub user_b: String,
 }
 
 /// Errors surfaced by [`SocialGraphClient`].
@@ -109,14 +139,11 @@ pub enum Error {
     },
 }
 
-/// Typed async client for the Social Graph service.
+/// Typed async client for the Social Graph internal resolution surface.
 ///
 /// Holds a [`reqwest::Client`] (share/clone one across the process so the
-/// connection pool is reused) and the service base URL. Bearer tokens are
-/// passed per call, not stored, because the two surfaces use different
-/// credentials: a per-user token for [`resolve_me`](Self::resolve_me) and the
-/// shared internal-service token for
-/// [`is_connected`](Self::is_connected).
+/// connection pool is reused) and the service base URL. The shared
+/// internal-service token is passed per call, not stored.
 #[derive(Clone, Debug)]
 pub struct SocialGraphClient {
     http: reqwest::Client,
@@ -135,204 +162,210 @@ impl SocialGraphClient {
         format!("{}{}", self.base_url, route)
     }
 
-    /// `GET /api/me` — resolve the caller's Social Graph `userId` from their
-    /// own bearer token.
-    ///
-    /// Returns [`Error::Status`] on any non-success response (e.g. `401` for a
-    /// token Social Graph won't accept).
-    pub async fn resolve_me(&self, user_token: &str) -> Result<String, Error> {
-        let response = self
-            .http
-            .get(self.url(ROUTE_ME))
-            .bearer_auth(user_token)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Status {
-                path: ROUTE_ME,
-                status: status.as_u16(),
-            });
-        }
-        Ok(response.json::<MeResponse>().await?.id)
-    }
-
-    /// `GET /internal/graph/is_connected` — ask whether Social Graph users
-    /// `a` and `b` are graph-connected, presenting the shared internal-service
-    /// token.
-    ///
-    /// Returns [`Error::Status`] on any non-success response: `503` when the
-    /// deployment has no internal token configured, `401` on token mismatch,
-    /// `400` when `a`/`b` are empty or equal.
-    pub async fn is_connected(
+    /// `POST /internal/graph/resolve-self` — resolve the caller's app-scoped
+    /// `sub` to this app's own pseudonym for them. `Ok(None)` when the sub is
+    /// not yet bridged into Social Graph.
+    pub async fn resolve_self(
         &self,
         internal_service_token: &str,
-        a: &str,
-        b: &str,
-    ) -> Result<bool, Error> {
+        subject_sub: &str,
+        client_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let body = ResolveSelfRequest {
+            subject_sub: subject_sub.to_owned(),
+            client_id: client_id.to_owned(),
+        };
         let response = self
             .http
-            .get(self.url(ROUTE_IS_CONNECTED))
+            .post(self.url(ROUTE_RESOLVE_SELF))
             .bearer_auth(internal_service_token)
-            .query(&[("a", a), ("b", b)])
+            .json(&body)
             .send()
             .await?;
         let status = response.status();
         if !status.is_success() {
             return Err(Error::Status {
-                path: ROUTE_IS_CONNECTED,
+                path: ROUTE_RESOLVE_SELF,
                 status: status.as_u16(),
             });
         }
-        Ok(response.json::<IsConnectedResponse>().await?.connected)
+        Ok(response.json::<ResolveSelfResponse>().await?.app_user_id)
+    }
+
+    /// `POST /internal/graph/resolve-audience` — the viewer's connections, as
+    /// this app's pseudonyms. These are the valid targets the viewer may act
+    /// on; membership in this set IS the connection check.
+    pub async fn resolve_audience(
+        &self,
+        internal_service_token: &str,
+        viewer_sub: &str,
+        client_id: &str,
+    ) -> Result<ResolveAudienceResponse, Error> {
+        let body = ResolveAudienceRequest {
+            viewer_sub: viewer_sub.to_owned(),
+            client_id: client_id.to_owned(),
+        };
+        let response = self
+            .http
+            .post(self.url(ROUTE_RESOLVE_AUDIENCE))
+            .bearer_auth(internal_service_token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Status {
+                path: ROUTE_RESOLVE_AUDIENCE,
+                status: status.as_u16(),
+            });
+        }
+        Ok(response.json::<ResolveAudienceResponse>().await?)
+    }
+
+    /// `POST /internal/graph/connected` — whether two app-scoped subs are
+    /// graph-connected. The server resolves both subs via the bridge first, so
+    /// an unbridged sub yields `false` (fail-visible), never an error.
+    pub async fn connected(
+        &self,
+        internal_service_token: &str,
+        viewer_sub: &str,
+        target_sub: &str,
+    ) -> Result<bool, Error> {
+        let body = ConnectedRequest {
+            viewer_sub: viewer_sub.to_owned(),
+            target_sub: target_sub.to_owned(),
+        };
+        let response = self
+            .http
+            .post(self.url(ROUTE_CONNECTED))
+            .bearer_auth(internal_service_token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Status {
+                path: ROUTE_CONNECTED,
+                status: status.as_u16(),
+            });
+        }
+        Ok(response.json::<ConnectedResponse>().await?.connected)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(server: &MockServer) -> SocialGraphClient {
         SocialGraphClient::new(reqwest::Client::new(), server.uri())
     }
 
-    #[test]
-    fn route_constants_match_server() {
-        assert_eq!(ROUTE_ME, "/api/me");
-        assert_eq!(ROUTE_IS_CONNECTED, "/internal/graph/is_connected");
-    }
-
-    #[test]
-    fn me_response_ignores_extra_server_fields() {
-        // The server's self-view carries email/displayName/avatarUrl too;
-        // MeResponse must tolerate them.
-        let body = serde_json::json!({
-            "id": "sg_alice",
-            "email": "a@x.test",
-            "displayName": "Alice",
-            "avatarUrl": null
-        });
-        let parsed: MeResponse = serde_json::from_value(body).unwrap();
-        assert_eq!(parsed.id, "sg_alice");
-    }
-
-    #[test]
-    fn is_connected_response_matches_server_field_names() {
-        // Server uses plain serde::Serialize: connected / user_a / user_b.
-        let body = serde_json::json!({
-            "connected": true,
-            "user_a": "sg_alice",
-            "user_b": "sg_bob"
-        });
-        let parsed: IsConnectedResponse = serde_json::from_value(body).unwrap();
+    #[tokio::test]
+    async fn url_joins_without_doubling_slash() {
+        let c = SocialGraphClient::new(reqwest::Client::new(), "https://sg.example/");
         assert_eq!(
-            parsed,
-            IsConnectedResponse {
-                connected: true,
-                user_a: "sg_alice".to_owned(),
-                user_b: "sg_bob".to_owned(),
-            }
+            c.url(ROUTE_RESOLVE_SELF),
+            "https://sg.example/internal/graph/resolve-self"
         );
     }
 
-    #[test]
-    fn base_url_trailing_slash_is_normalized() {
-        let c = SocialGraphClient::new(reqwest::Client::new(), "https://sg.example/");
-        assert_eq!(c.url(ROUTE_ME), "https://sg.example/api/me");
-    }
-
     #[tokio::test]
-    async fn resolve_me_sends_bearer_and_returns_id() {
+    async fn resolve_self_posts_body_and_returns_pseudonym() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/me"))
-            .and(header("authorization", "Bearer usertok"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "sg_alice",
-                "email": "a@x.test",
-                "displayName": "Alice"
-            })))
-            .mount(&server)
-            .await;
-        let id = client(&server).resolve_me("usertok").await.unwrap();
-        assert_eq!(id, "sg_alice");
-    }
-
-    #[tokio::test]
-    async fn resolve_me_surfaces_non_success_status() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/me"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server)
-            .await;
-        match client(&server).resolve_me("bad").await {
-            Err(Error::Status { path, status }) => {
-                assert_eq!(path, ROUTE_ME);
-                assert_eq!(status, 401);
-            }
-            other => panic!("expected Status error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn is_connected_uses_internal_token_and_parses_true() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/internal/graph/is_connected"))
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/resolve-self"))
             .and(header("authorization", "Bearer secret-internal"))
-            .and(query_param("a", "sg_alice"))
-            .and(query_param("b", "sg_bob"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "connected": true,
-                "user_a": "sg_alice",
-                "user_b": "sg_bob"
+            .and(body_json(serde_json::json!({
+                "subject_sub": "sub_app_alice", "client_id": "my-app"
             })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "app_user_id": "psd_alice" })),
+            )
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .resolve_self("secret-internal", "sub_app_alice", "my-app")
+            .await
+            .unwrap();
+        assert_eq!(got, Some("psd_alice".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn resolve_self_unbridged_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/resolve-self"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "app_user_id": null })),
+            )
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .resolve_self("secret-internal", "sub_unbridged", "my-app")
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_audience_returns_pseudonyms() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/resolve-audience"))
+            .and(header("authorization", "Bearer secret-internal"))
+            .and(body_json(serde_json::json!({
+                "viewer_sub": "sub_app_alice", "client_id": "my-app"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resolved": true, "audience": ["psd_bob", "psd_carol"]
+            })))
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .resolve_audience("secret-internal", "sub_app_alice", "my-app")
+            .await
+            .unwrap();
+        assert!(got.resolved);
+        assert_eq!(got.audience, vec!["psd_bob".to_owned(), "psd_carol".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn connected_parses_bool() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/connected"))
+            .and(header("authorization", "Bearer secret-internal"))
+            .and(body_json(serde_json::json!({
+                "viewer_sub": "sub_a", "target_sub": "sub_b"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "connected": true })),
+            )
             .mount(&server)
             .await;
         assert!(client(&server)
-            .is_connected("secret-internal", "sg_alice", "sg_bob")
+            .connected("secret-internal", "sub_a", "sub_b")
             .await
             .unwrap());
     }
 
     #[tokio::test]
-    async fn is_connected_false_is_respected() {
+    async fn non_success_status_is_surfaced() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/internal/graph/is_connected"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "connected": false,
-                "user_a": "sg_alice",
-                "user_b": "sg_carol"
-            })))
-            .mount(&server)
-            .await;
-        assert!(!client(&server)
-            .is_connected("secret-internal", "sg_alice", "sg_carol")
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn is_connected_surfaces_503_when_unconfigured() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/internal/graph/is_connected"))
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/connected"))
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        match client(&server)
-            .is_connected("secret-internal", "sg_alice", "sg_bob")
+        let err = client(&server)
+            .connected("secret-internal", "sub_a", "sub_b")
             .await
-        {
-            Err(Error::Status { path, status }) => {
-                assert_eq!(path, ROUTE_IS_CONNECTED);
-                assert_eq!(status, 503);
-            }
-            other => panic!("expected Status error, got {other:?}"),
-        }
+            .unwrap_err();
+        assert!(matches!(err, Error::Status { status: 503, .. }));
     }
 }
