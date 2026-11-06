@@ -7,17 +7,21 @@ and route paths live here, derived from the real server handlers, so consumers
 
 ## What it does
 
-- Owns the wire types: [`MeResponse`] (`GET /api/me`) and
-  [`IsConnectedResponse`] (`GET /internal/graph/is_connected`).
-- Owns the route-path constants `ROUTE_ME` and `ROUTE_IS_CONNECTED`.
+- Owns the wire types and route-path constants (`ROUTE_*`) for Social Graph's
+  internal-service surface.
 - Provides a small typed async client over `reqwest`.
 
 ## Surfaces
 
-| Endpoint | Credential | Returns |
-| --- | --- | --- |
-| `GET /api/me` | the caller's own user bearer | the caller's Social Graph `userId` |
-| `GET /internal/graph/is_connected?a=&b=` | shared internal-service token | whether two users are connected |
+Every route takes a chirp machine token from an allowlisted client, and
+app-scoped chirp `sub`s as input. None returns a global user id.
+
+| Endpoint | Returns |
+| --- | --- |
+| `POST /internal/graph/resolve-self` | the app's pseudonym for its own user, or `null` if the sub isn't bridged |
+| `POST /internal/graph/resolve-audience` | the viewer's connections, as this app's pseudonyms |
+| `POST /internal/graph/connected` | whether two subs are a current connection |
+| `POST /internal/graph/connection-display-name` (0.3.0) | the target's display name, or `null` unless the two subs are a current connection |
 
 ## Usage
 
@@ -26,16 +30,15 @@ use social_graph_client::SocialGraphClient;
 
 let client = SocialGraphClient::new(
     reqwest::Client::new(),
-    "https://socialgraph.example",
+    "https://socialgraph.stackwell.tech",
 );
+let token = "machine-token";
 
-// Resolve the caller (presenting their own user bearer) to their userId.
-let my_id = client.resolve_me("user-bearer-token").await?;
-
-// Ask whether two users are connected, presenting the shared internal token.
-let connected = client
-    .is_connected("internal-service-token", &my_id, "sg_other")
-    .await?;
+let me = client.resolve_self(token, "sub_app_alice", "my-app").await?;
+let connected = client.connected(token, "sub_app_alice", "sub_app_bob").await?;
+let name = client
+    .connection_display_name(token, "sub_app_alice", "sub_app_bob")
+    .await?; // Some("Bob …") only while they're connected
 ```
 
 ## Error policy

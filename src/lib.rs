@@ -8,7 +8,7 @@
 //!
 //! # The pairwise / pseudonym surface (since 0.2.0)
 //!
-//! All three modeled surfaces are **internal-service** endpoints: the caller
+//! All modeled surfaces are **internal-service** endpoints: the caller
 //! presents the shared bearer token (`SOCIAL_GRAPH_INTERNAL_SERVICE_TOKEN`)
 //! out-of-band, passes an **app-scoped chirp `sub`** (pairwise per app — a
 //! different sub per app for the same human) as input, and gets back the app's
@@ -23,6 +23,11 @@
 //! - **`POST /internal/graph/connected`** → whether two subs are graph-connected
 //!   ([`connected`](SocialGraphClient::connected)); resolves both via the
 //!   `(chirp_sub -> users.id)` bridge.
+//! - **`POST /internal/graph/connection-display-name`** (since 0.3.0) → the
+//!   display name of one of the viewer's connections
+//!   ([`connection_display_name`](SocialGraphClient::connection_display_name)),
+//!   for showing the viewer who did something without handing them an id.
+//!   `None` unless the two subs are a current mutual connection.
 //!
 //! The legacy `GET /api/me` (`resolve_me`) and `GET /internal/graph/is_connected`
 //! (`is_connected`) surfaces — which handed apps the global `users.id` and so
@@ -62,6 +67,9 @@ pub const ROUTE_RESOLVE_AUDIENCE: &str = "/internal/graph/resolve-audience";
 
 /// `POST` route asking whether two app-scoped subs are graph-connected.
 pub const ROUTE_CONNECTED: &str = "/internal/graph/connected";
+
+/// `POST` route naming one of the viewer's current connections.
+pub const ROUTE_CONNECTION_DISPLAY_NAME: &str = "/internal/graph/connection-display-name";
 
 /// Request body for [`resolve_self`](SocialGraphClient::resolve_self).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +122,26 @@ pub struct ConnectedResponse {
     /// Whether the two subjects are graph-connected. `false` if either sub is
     /// unbridged (the server resolves both via the bridge first).
     pub connected: bool,
+}
+
+/// Request body for
+/// [`connection_display_name`](SocialGraphClient::connection_display_name).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionDisplayNameRequest {
+    /// The viewer's app-scoped chirp `sub`: the person the name is shown to.
+    pub viewer_sub: String,
+    /// The app-scoped chirp `sub` of the person to name.
+    pub target_sub: String,
+}
+
+/// Response of
+/// [`connection_display_name`](SocialGraphClient::connection_display_name).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionDisplayNameResponse {
+    /// The target's display name; `None` (server: `null`) unless viewer and
+    /// target are a current mutual connection. A stranger, an unbridged sub,
+    /// the viewer themselves and a terminated account all get `None`.
+    pub display_name: Option<String>,
 }
 
 /// Errors surfaced by [`SocialGraphClient`].
@@ -251,6 +279,40 @@ impl SocialGraphClient {
         }
         Ok(response.json::<ConnectedResponse>().await?.connected)
     }
+
+    /// `POST /internal/graph/connection-display-name` — the display name of
+    /// `target_sub`, as the viewer sees it in their own connection list.
+    /// `Ok(None)` unless the two subs are a current mutual connection, so it
+    /// names no strangers and can't enumerate users.
+    pub async fn connection_display_name(
+        &self,
+        internal_service_token: &str,
+        viewer_sub: &str,
+        target_sub: &str,
+    ) -> Result<Option<String>, Error> {
+        let body = ConnectionDisplayNameRequest {
+            viewer_sub: viewer_sub.to_owned(),
+            target_sub: target_sub.to_owned(),
+        };
+        let response = self
+            .http
+            .post(self.url(ROUTE_CONNECTION_DISPLAY_NAME))
+            .bearer_auth(internal_service_token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Status {
+                path: ROUTE_CONNECTION_DISPLAY_NAME,
+                status: status.as_u16(),
+            });
+        }
+        Ok(response
+            .json::<ConnectionDisplayNameResponse>()
+            .await?
+            .display_name)
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +414,46 @@ mod tests {
             .connected("secret-internal", "sub_a", "sub_b")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn connection_display_name_posts_body_and_returns_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/connection-display-name"))
+            .and(header("authorization", "Bearer secret-internal"))
+            .and(body_json(serde_json::json!({
+                "viewer_sub": "sub_a", "target_sub": "sub_b"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "display_name": "Bob Builder" })),
+            )
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .connection_display_name("secret-internal", "sub_a", "sub_b")
+            .await
+            .unwrap();
+        assert_eq!(got, Some("Bob Builder".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn connection_display_name_of_a_non_connection_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/graph/connection-display-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "display_name": null })),
+            )
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .connection_display_name("secret-internal", "sub_a", "sub_stranger")
+            .await
+            .unwrap();
+        assert_eq!(got, None);
     }
 
     #[tokio::test]
