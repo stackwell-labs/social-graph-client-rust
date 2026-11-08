@@ -18,8 +18,6 @@ app-scoped chirp `sub`s as input. None returns a global user id.
 
 | Endpoint | Returns |
 | --- | --- |
-| `POST /internal/graph/resolve-self` | the app's pseudonym for its own user, or `null` if the sub isn't bridged |
-| `POST /internal/graph/resolve-audience` | the viewer's connections, as this app's pseudonyms |
 | `POST /internal/graph/connected` | whether two subs are a current connection |
 | `POST /internal/graph/connection-display-name` (0.3.0) | the target's display name, or `null` unless the two subs are a current connection |
 
@@ -34,12 +32,18 @@ let client = SocialGraphClient::new(
 );
 let token = "machine-token";
 
-let me = client.resolve_self(token, "sub_app_alice", "my-app").await?;
 let connected = client.connected(token, "sub_app_alice", "sub_app_bob").await?;
 let name = client
     .connection_display_name(token, "sub_app_alice", "sub_app_bob")
     .await?; // Some("Bob …") only while they're connected
 ```
+
+0.4.0 dropped `resolve_self` and `resolve_audience`: Social Graph retired
+`/internal/graph/resolve-self` and `/resolve-audience` (social-graph#39),
+because they minted pseudonyms in whatever namespace the caller named. An app
+gets its own pseudonyms through Social Graph's graph-access plane instead.
+Removing the methods makes a stale caller fail to compile rather than at
+runtime (social-graph#62).
 
 ## Error policy
 

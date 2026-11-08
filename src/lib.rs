@@ -6,20 +6,15 @@
 //! …); those copies drift. Anything in this crate is derived from the real
 //! server handlers in `social-graph/backend/src/api/social_graph.rs`.
 //!
-//! # The pairwise / pseudonym surface (since 0.2.0)
+//! # The internal surface
 //!
 //! All modeled surfaces are **internal-service** endpoints: the caller
-//! presents the shared bearer token (`SOCIAL_GRAPH_INTERNAL_SERVICE_TOKEN`)
-//! out-of-band, passes an **app-scoped chirp `sub`** (pairwise per app — a
-//! different sub per app for the same human) as input, and gets back the app's
-//! own opaque **per-(app, user) pseudonym** or a connectedness bool — **never a
-//! global `users.id`**, so two apps can't correlate the same human.
+//! presents a chirp machine token from an allowlisted client, passes
+//! **app-scoped chirp `sub`s** (pairwise per app: a different sub per app for
+//! the same human) as input, and gets back a relationship answer. None returns
+//! a person's id, global or pseudonymous, so two apps can't correlate the same
+//! human through this surface.
 //!
-//! - **`POST /internal/graph/resolve-self`** → the app's own pseudonym for its
-//!   own user ([`resolve_self`](SocialGraphClient::resolve_self)). `None` when
-//!   the sub isn't bridged yet (fail-visible).
-//! - **`POST /internal/graph/resolve-audience`** → the user's connections, as
-//!   *this app's* pseudonyms ([`resolve_audience`](SocialGraphClient::resolve_audience)).
 //! - **`POST /internal/graph/connected`** → whether two subs are graph-connected
 //!   ([`connected`](SocialGraphClient::connected)); resolves both via the
 //!   `(chirp_sub -> users.id)` bridge.
@@ -29,9 +24,19 @@
 //!   for showing the viewer who did something without handing them an id.
 //!   `None` unless the two subs are a current mutual connection.
 //!
-//! The legacy `GET /api/me` (`resolve_me`) and `GET /internal/graph/is_connected`
-//! (`is_connected`) surfaces — which handed apps the global `users.id` and so
-//! let two apps correlate a shared user — were **retired in 0.2.0**.
+//! # Retired surfaces
+//!
+//! - **0.4.0** dropped `resolve_self` and `resolve_audience`
+//!   (`/internal/graph/resolve-self`, `/resolve-audience`). They minted
+//!   pseudonyms in whatever namespace the request body named, so any
+//!   allowlisted caller could read any app's pseudonyms, and Social Graph
+//!   retired both routes (social-graph#39). An app gets its own pseudonyms
+//!   through Social Graph's graph-access plane, whose namespace is the app's
+//!   own grant. They are removed rather than kept, so a stale caller fails to
+//!   compile instead of failing at runtime (social-graph#62).
+//! - **0.2.0** dropped `GET /api/me` (`resolve_me`) and
+//!   `GET /internal/graph/is_connected` (`is_connected`), which handed apps
+//!   the global `users.id` and so let two apps correlate a shared user.
 //!
 //! # Example
 //!
@@ -43,14 +48,16 @@
 //!     reqwest::Client::new(),
 //!     "https://socialgraph.example",
 //! );
-//! let token = "internal-service-token";
+//! let token = "machine-token";
 //!
-//! // Resolve the caller's app-scoped sub to this app's pseudonym for them.
-//! let me = client.resolve_self(token, "sub_app_alice", "my-app").await?;
+//! // Whether the two app-scoped subs are a current connection.
+//! let connected = client.connected(token, "sub_app_alice", "sub_app_bob").await?;
 //!
-//! // Their connections, as this app's pseudonyms (the valid send targets).
-//! let audience = client.resolve_audience(token, "sub_app_alice", "my-app").await?;
-//! # let _ = (me, audience);
+//! // Bob's display name as Alice sees it; `None` unless they're connected.
+//! let name = client
+//!     .connection_display_name(token, "sub_app_alice", "sub_app_bob")
+//!     .await?;
+//! # let _ = (connected, name);
 //! # Ok(())
 //! # }
 //! ```
@@ -59,53 +66,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `POST` route resolving an app-scoped sub to the app's own pseudonym.
-pub const ROUTE_RESOLVE_SELF: &str = "/internal/graph/resolve-self";
-
-/// `POST` route resolving a viewer's connections to the app's pseudonyms.
-pub const ROUTE_RESOLVE_AUDIENCE: &str = "/internal/graph/resolve-audience";
-
 /// `POST` route asking whether two app-scoped subs are graph-connected.
 pub const ROUTE_CONNECTED: &str = "/internal/graph/connected";
 
 /// `POST` route naming one of the viewer's current connections.
 pub const ROUTE_CONNECTION_DISPLAY_NAME: &str = "/internal/graph/connection-display-name";
-
-/// Request body for [`resolve_self`](SocialGraphClient::resolve_self).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveSelfRequest {
-    /// The caller's app-scoped chirp `sub` (pairwise per app).
-    pub subject_sub: String,
-    /// The app's client id — the namespace its pseudonyms are minted under.
-    pub client_id: String,
-}
-
-/// Response of [`resolve_self`](SocialGraphClient::resolve_self).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveSelfResponse {
-    /// The app's own pseudonym for its own user; `None` (server: `null`) when
-    /// the sub is not yet bridged into Social Graph (fail-visible).
-    pub app_user_id: Option<String>,
-}
-
-/// Request body for [`resolve_audience`](SocialGraphClient::resolve_audience).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveAudienceRequest {
-    /// The viewer's app-scoped chirp `sub`.
-    pub viewer_sub: String,
-    /// The app's client id (pseudonym namespace).
-    pub client_id: String,
-}
-
-/// Response of [`resolve_audience`](SocialGraphClient::resolve_audience).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveAudienceResponse {
-    /// `false` when the viewer sub isn't bridged — distinguishes "unknown
-    /// viewer" from "viewer with no connections".
-    pub resolved: bool,
-    /// The viewer's connections, as *this app's* pseudonyms (never raw ids).
-    pub audience: Vec<String>,
-}
 
 /// Request body for [`connected`](SocialGraphClient::connected).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +132,7 @@ pub enum Error {
     },
 }
 
-/// Typed async client for the Social Graph internal resolution surface.
+/// Typed async client for the Social Graph internal surface.
 ///
 /// Holds a [`reqwest::Client`] (share/clone one across the process so the
 /// connection pool is reused) and the service base URL. The shared
@@ -188,66 +153,6 @@ impl SocialGraphClient {
 
     fn url(&self, route: &str) -> String {
         format!("{}{}", self.base_url, route)
-    }
-
-    /// `POST /internal/graph/resolve-self` — resolve the caller's app-scoped
-    /// `sub` to this app's own pseudonym for them. `Ok(None)` when the sub is
-    /// not yet bridged into Social Graph.
-    pub async fn resolve_self(
-        &self,
-        internal_service_token: &str,
-        subject_sub: &str,
-        client_id: &str,
-    ) -> Result<Option<String>, Error> {
-        let body = ResolveSelfRequest {
-            subject_sub: subject_sub.to_owned(),
-            client_id: client_id.to_owned(),
-        };
-        let response = self
-            .http
-            .post(self.url(ROUTE_RESOLVE_SELF))
-            .bearer_auth(internal_service_token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Status {
-                path: ROUTE_RESOLVE_SELF,
-                status: status.as_u16(),
-            });
-        }
-        Ok(response.json::<ResolveSelfResponse>().await?.app_user_id)
-    }
-
-    /// `POST /internal/graph/resolve-audience` — the viewer's connections, as
-    /// this app's pseudonyms. These are the valid targets the viewer may act
-    /// on; membership in this set IS the connection check.
-    pub async fn resolve_audience(
-        &self,
-        internal_service_token: &str,
-        viewer_sub: &str,
-        client_id: &str,
-    ) -> Result<ResolveAudienceResponse, Error> {
-        let body = ResolveAudienceRequest {
-            viewer_sub: viewer_sub.to_owned(),
-            client_id: client_id.to_owned(),
-        };
-        let response = self
-            .http
-            .post(self.url(ROUTE_RESOLVE_AUDIENCE))
-            .bearer_auth(internal_service_token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Status {
-                path: ROUTE_RESOLVE_AUDIENCE,
-                status: status.as_u16(),
-            });
-        }
-        Ok(response.json::<ResolveAudienceResponse>().await?)
     }
 
     /// `POST /internal/graph/connected` — whether two app-scoped subs are
@@ -329,71 +234,9 @@ mod tests {
     async fn url_joins_without_doubling_slash() {
         let c = SocialGraphClient::new(reqwest::Client::new(), "https://sg.example/");
         assert_eq!(
-            c.url(ROUTE_RESOLVE_SELF),
-            "https://sg.example/internal/graph/resolve-self"
+            c.url(ROUTE_CONNECTED),
+            "https://sg.example/internal/graph/connected"
         );
-    }
-
-    #[tokio::test]
-    async fn resolve_self_posts_body_and_returns_pseudonym() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/internal/graph/resolve-self"))
-            .and(header("authorization", "Bearer secret-internal"))
-            .and(body_json(serde_json::json!({
-                "subject_sub": "sub_app_alice", "client_id": "my-app"
-            })))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "app_user_id": "psd_alice" })),
-            )
-            .mount(&server)
-            .await;
-        let got = client(&server)
-            .resolve_self("secret-internal", "sub_app_alice", "my-app")
-            .await
-            .unwrap();
-        assert_eq!(got, Some("psd_alice".to_owned()));
-    }
-
-    #[tokio::test]
-    async fn resolve_self_unbridged_is_none() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/internal/graph/resolve-self"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "app_user_id": null })),
-            )
-            .mount(&server)
-            .await;
-        let got = client(&server)
-            .resolve_self("secret-internal", "sub_unbridged", "my-app")
-            .await
-            .unwrap();
-        assert_eq!(got, None);
-    }
-
-    #[tokio::test]
-    async fn resolve_audience_returns_pseudonyms() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/internal/graph/resolve-audience"))
-            .and(header("authorization", "Bearer secret-internal"))
-            .and(body_json(serde_json::json!({
-                "viewer_sub": "sub_app_alice", "client_id": "my-app"
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "resolved": true, "audience": ["psd_bob", "psd_carol"]
-            })))
-            .mount(&server)
-            .await;
-        let got = client(&server)
-            .resolve_audience("secret-internal", "sub_app_alice", "my-app")
-            .await
-            .unwrap();
-        assert!(got.resolved);
-        assert_eq!(got.audience, vec!["psd_bob".to_owned(), "psd_carol".to_owned()]);
     }
 
     #[tokio::test]
